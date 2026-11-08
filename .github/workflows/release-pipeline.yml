@@ -1,0 +1,206 @@
+name: NoteSprint Multi-Environment Pipeline (EC2 + S3)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # -------------------------------------------------------------
+  # STAGE 1: Continuous Integration (Lint, Test, Build Check)
+  # -------------------------------------------------------------
+  ci:
+    name: Run Tests & Build Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install & Test Backend
+        working-directory: ./backend
+        run: |
+          npm ci
+          npm test
+
+      - name: Verify Frontend Compilation
+        working-directory: ./frontend
+        run: |
+          npm ci
+          npm run build
+
+  # -------------------------------------------------------------
+  # STAGE 2: Automated Deployment to DEVELOPMENT Environment
+  # -------------------------------------------------------------
+  deploy-development:
+    name: Deploy to Development (EC2 + S3)
+    needs: [ ci ]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment:
+      name: development
+      url: ${{ vars.FRONTEND_URL }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 1. DEPLOY BACKEND TO DEV EC2
+      - name: Deploy Backend to Dev EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            echo "🚀 Deploying Backend to Dev EC2..."
+            APP_DIR="${{ vars.APP_DIR || 'notesprint-dev' }}"
+            mkdir -p ~/$APP_DIR
+            cd ~/$APP_DIR
+
+            if [ -d ".git" ]; then
+              git pull origin main
+            else
+              git clone https://github.com/${{ github.repository }}.git .
+            fi
+
+            cd backend
+            npm ci --omit=dev
+
+            cat << 'EOF' > .env
+            PORT=${{ vars.PORT || '5000' }}
+            NODE_ENV=development
+            MONGO_URI=${{ secrets.MONGO_URI }}
+            EOF
+
+            APP_NAME="${{ vars.PM2_APP_NAME || 'notesprint-dev' }}"
+            pm2 restart $APP_NAME || pm2 start src/index.js --name $APP_NAME
+            pm2 save
+            echo "✅ Backend running under PM2 ($APP_NAME)"
+
+      # 2. SMOKE TEST BACKEND
+      - name: Verify Dev Backend Health Check
+        run: |
+          echo "Waiting 5 seconds for backend to start..."
+          sleep 5
+          curl -f "${{ vars.API_URL }}/api/health" || { echo "Dev Backend Health Check Failed!"; exit 1; }
+          echo "✅ Dev Backend is healthy!"
+
+      # 3. BUILD FRONTEND WITH DEV API URL
+      - name: Build Frontend for Dev
+        working-directory: ./frontend
+        env:
+          VITE_API_URL: ${{ vars.API_URL }}
+        run: |
+          npm ci
+          npm run build
+
+      # 4. DEPLOY FRONTEND TO DEV S3
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy Frontend to Dev S3
+        run: |
+          aws s3 sync ./frontend/dist s3://${{ secrets.S3_BUCKET }} --delete
+          echo "✅ Frontend deployed to Dev S3 bucket"
+
+  # -------------------------------------------------------------
+  # STAGE 3: Manual Approval Gate & Deployment to PRODUCTION
+  # -------------------------------------------------------------
+  deploy-production:
+    name: Deploy to Production (EC2 + S3)
+    needs: [ deploy-development ]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # Pauses here until manual approval is granted in GitHub UI!
+    environment:
+      name: production
+      url: ${{ vars.FRONTEND_URL }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # 1. DEPLOY BACKEND TO PROD EC2
+      - name: Deploy Backend to Production EC2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            echo "🚀 Deploying Backend to Production EC2..."
+            APP_DIR="${{ vars.APP_DIR || 'notesprint-prod' }}"
+            mkdir -p ~/$APP_DIR
+            cd ~/$APP_DIR
+
+            if [ -d ".git" ]; then
+              git pull origin main
+            else
+              git clone https://github.com/${{ github.repository }}.git .
+            fi
+
+            cd backend
+            npm ci --omit=dev
+
+            cat << 'EOF' > .env
+            PORT=${{ vars.PORT || '5001' }}
+            NODE_ENV=production
+            MONGO_URI=${{ secrets.MONGO_URI }}
+            EOF
+
+            APP_NAME="${{ vars.PM2_APP_NAME || 'notesprint-prod' }}"
+            pm2 restart $APP_NAME || pm2 start src/index.js --name $APP_NAME
+            pm2 save
+            echo "✅ Backend running under PM2 ($APP_NAME)"
+
+      # 2. SMOKE TEST PROD BACKEND
+      - name: Verify Production Backend Health Check
+        run: |
+          echo "Waiting 5 seconds for backend to start..."
+          sleep 5
+          curl -f "${{ vars.API_URL }}/api/health" || { echo "Production Backend Health Check Failed!"; exit 1; }
+          echo "✅ Production Backend is healthy!"
+
+      # 3. BUILD FRONTEND WITH PROD API URL
+      - name: Build Frontend for Production
+        working-directory: ./frontend
+        env:
+          VITE_API_URL: ${{ vars.API_URL }}
+        run: |
+          npm ci
+          npm run build
+
+      # 4. DEPLOY FRONTEND TO PROD S3
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy Frontend to Production S3
+        run: |
+          aws s3 sync ./frontend/dist s3://${{ secrets.S3_BUCKET }} --delete
+          echo "✅ Frontend deployed to Production S3 bucket"
