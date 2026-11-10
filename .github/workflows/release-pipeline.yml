@@ -180,8 +180,10 @@ jobs:
         run: |
           echo "Waiting 5 seconds for backend to start..."
           sleep 5
-          curl -f "${{ vars.API_URL }}/api/health" || { echo "Production Backend Health Check Failed!"; exit 1; }
-          echo "✅ Production Backend is healthy!"
+          API_ENDPOINT="${{ vars.API_URL || 'http://15.135.137.216:5000' }}"
+          echo "Testing endpoint: ${API_ENDPOINT}/api/health"
+          curl -f "${API_ENDPOINT}/api/health" || { echo "Dev Backend Health Check Failed!"; exit 1; }
+          echo "✅ Dev Backend is healthy!"
 
       # 3. BUILD FRONTEND WITH PROD API URL
       - name: Build Frontend for Production
